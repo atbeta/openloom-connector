@@ -1,0 +1,17 @@
+# Example config for the local filesystem connector.
+# Run with: openloom-connector run --config examples/local_fs.yaml
+
+openloom:
+  url: http://127.0.0.1:55413
+
+connector:
+  class: local_fs.LocalFilesystemConnector
+  kwargs:
+    base_dir: .
+
+paths:
+  inbox: inbox
+  outbox: outbox
+  archive: archive
+
+poll_interval_seconds: 5
