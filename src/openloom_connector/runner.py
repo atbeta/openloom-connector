@@ -449,19 +449,65 @@ def _render_result(result: dict[str, Any], source_ext: str) -> bytes:
     return json.dumps(result, indent=2).encode()
 
 
+# ── docx rendering ────────────────────────────────────────────────────────
+
+
+_STATUS_HEADING = {
+    "completed": "任务完成报告",
+    "failed": "任务失败报告",
+    "running": "任务进行中",
+    "waiting": "任务等待中",
+    "archived": "任务已归档",
+}
+
+
 def _render_docx_result(result: dict[str, Any]) -> io.BytesIO:
-    """Render a result as a 2-column docx table for human reading."""
+    """Render a result as a structured docx for phone-friendly reading.
+
+    Layout (three sections):
+
+      1. Header — task_name + status (heading) + timestamp
+      2. Summary — the agent's ``summary`` text (one paragraph)
+      3. Agent trace — each recent_activity entry becomes its own
+         block with timestamp + text + tool calls (each tool on its
+         own line, indented). Tools are visually separated from the
+         prose so they do not mix into the agent's narrative.
+      4. Metadata — anything left over (e.g. active_session_id) in a
+         small two-column table.
+    """
     from docx import Document
 
     doc = Document()
-    doc.add_heading("OpenLoom Task Result", level=1)
 
-    table = doc.add_table(rows=0, cols=2)
-    table.style = "Light List Accent 1"
-    for key, value in _flatten_for_docx(result):
-        row = table.add_row().cells
-        row[0].text = str(key)
-        row[1].text = str(value)
+    status = str(result.get("status") or "").lower()
+    heading_text = _STATUS_HEADING.get(status, "OpenLoom Task Result")
+    doc.add_heading(heading_text, level=1)
+
+    task_name = str(result.get("task_name") or result.get("task_id") or "")
+    if task_name:
+        doc.add_heading(task_name, level=2)
+
+    _docx_add_metadata_block(doc, result)
+
+    data = result.get("data") or {}
+    if isinstance(data, dict):
+        summary = str(data.get("summary") or "").strip()
+        if summary:
+            doc.add_heading("概要", level=2)
+            doc.add_paragraph(summary)
+
+        recent = data.get("recent_activity")
+        if isinstance(recent, list) and recent:
+            _docx_add_trace(doc, recent)
+
+        leftover = _docx_leftover(data)
+        if leftover:
+            doc.add_heading("其他信息", level=2)
+            table = doc.add_table(rows=0, cols=2)
+            for k, v in leftover.items():
+                row = table.add_row().cells
+                row[0].text = str(k)
+                row[1].text = _truncate_text(str(v), 400)
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -469,8 +515,116 @@ def _render_docx_result(result: dict[str, Any]) -> io.BytesIO:
     return buf
 
 
+def _docx_add_metadata_block(doc: Any, result: dict[str, Any]) -> None:
+    """Top-level status banner: task_id, status, timestamp."""
+    from datetime import UTC, datetime
+
+    lines: list[str] = []
+    status = str(result.get("status") or "")
+    task_id = str(result.get("task_id") or "")
+    timestamp = result.get("timestamp")
+    if status:
+        lines.append(f"状态: {status}")
+    if task_id:
+        lines.append(f"任务 ID: {task_id}")
+    if isinstance(timestamp, (int, float)) and timestamp > 0:
+        iso = datetime.fromtimestamp(timestamp, tz=UTC).strftime("%Y-%m-%d %H:%M:%S")
+        lines.append(f"时间: {iso}")
+
+    if lines:
+        para = doc.add_paragraph()
+        for line in lines:
+            run = para.add_run(line + "\n")
+            run.font.size = None
+        para.runs[0].bold = True
+
+
+_TOOL_STATUS_GLYPH = {
+    "completed": "✓",
+    "running": "▶",
+    "pending": "…",
+    "active": "▶",
+    "failed": "✗",
+    "error": "✗",
+}
+
+
+def _docx_add_trace(doc: Any, recent: list[Any]) -> None:
+    """Render recent_activity as a separate block per entry.
+
+    Each entry is its own paragraph: a one-line heading (counter +
+    timestamp + status), then the agent text, then a list of tool
+    calls. Tools are rendered as indented bullet items so they read
+    as a separate list from the agent's prose.
+    """
+    from datetime import UTC, datetime
+
+    doc.add_heading(f"Agent 执行轨迹（共 {len(recent)} 条）", level=2)
+
+    for idx, entry in enumerate(recent, start=1):
+        if not isinstance(entry, dict):
+            continue
+        ts = ""
+        completed = entry.get("completed_at")
+        if isinstance(completed, (int, float)) and completed > 0:
+            ts = datetime.fromtimestamp(
+                completed / 1000 if completed > 1e12 else completed,
+                tz=UTC,
+            ).strftime("%H:%M:%S")
+
+        head = doc.add_paragraph()
+        head_run = head.add_run(f"{idx}. {ts}".rstrip())
+        head_run.bold = True
+
+        text = str(entry.get("text") or "").strip()
+        if text:
+            doc.add_paragraph(text)
+
+        tools = entry.get("tools") or []
+        if isinstance(tools, list) and tools:
+            for tool in tools:
+                if not isinstance(tool, dict):
+                    continue
+                _docx_add_tool_line(doc, tool)
+
+
+def _docx_add_tool_line(doc: Any, tool: dict[str, Any]) -> None:
+    """One bullet for a single tool call, glyph by status."""
+    name = str(tool.get("tool") or tool.get("name") or "tool")
+    status = str(tool.get("status") or "unknown").lower()
+    glyph = _TOOL_STATUS_GLYPH.get(status, "•")
+    excerpt = _truncate_text(str(tool.get("input_excerpt") or ""), 200)
+    line = f"    {glyph} {name} [{status}]"
+    if excerpt:
+        line += f"  {excerpt}"
+
+    para = doc.add_paragraph()
+    para.paragraph_format.left_indent = None
+    run = para.add_run(line)
+    run.font.name = "Consolas"
+
+
+def _docx_leftover(data: dict[str, Any]) -> dict[str, Any]:
+    """Return data keys that were not already promoted to a section."""
+    used = {"summary", "recent_activity"}
+    return {k: v for k, v in data.items() if k not in used}
+
+
+def _truncate_text(s: str, limit: int) -> str:
+    if len(s) <= limit:
+        return s
+    return s[: max(0, limit - 1)] + "…"
+
+
+# ── legacy helpers (kept for callers that still depend on the flatten table) ─
+
+
 def _flatten_for_docx(result: dict[str, Any]) -> list[tuple[str, str]]:
-    """Flatten a result dict into (key, str_value) rows for the docx table."""
+    """Deprecated. Use ``_render_docx_result`` directly.
+
+    Kept for tests that still assert the old 2-column row shape; new
+    consumers should not depend on this.
+    """
     flat: list[tuple[str, str]] = []
     for key in ("schema_version", "task_id", "task_name", "status"):
         if key in result:

@@ -356,19 +356,130 @@ def test_write_result_docx_round_trip() -> None:
     result_bytes = conn.files["/outbox/task-doc.result.docx"]
     assert result_bytes[:2] == b"PK"  # docx is a zip
 
-    # Parse it back
+    # Parse it back — new layout: heading + metadata block + summary section
     from docx import Document
     doc = Document(io.BytesIO(result_bytes))
-    rows = {doc.tables[0].rows[i].cells[0].text: doc.tables[0].rows[i].cells[1].text
-            for i in range(len(doc.tables[0].rows))}
-    assert rows["task_id"] == "task_doc"
-    assert rows["status"] == "completed"
-    assert rows["task_name"] == "doc task"
-    assert rows["data.summary"] == "done"
+    headings = [p.text for p in doc.paragraphs if p.style.name.startswith("Heading")]
+    assert "任务完成报告" in headings
+    assert "doc task" in headings
+    assert "概要" in headings
+    body_texts = [p.text for p in doc.paragraphs]
+    assert any("done" in t for t in body_texts)
 
     # Archive + delete
     assert "/inbox/task-doc.docx" not in conn.files
     assert "/archive/task-doc.docx" in conn.files
+
+
+def test_docx_result_renders_recent_activity_as_separate_blocks() -> None:
+    """recent_activity entries must render as distinct sections, and the
+    tools inside each entry must be visually separated from the agent
+    prose — the JSON-dump blob we used to write was unreadable."""
+    from openloom_connector.runner import _render_docx_result
+
+    result = {
+        "schema_version": "1.0",
+        "task_id": "task_abc",
+        "task_name": "登录 CSS 修复",
+        "status": "completed",
+        "timestamp": 1_700_000_000.0,
+        "data": {
+            "summary": "Agent reported TASK COMPLETE",
+            "recent_activity": [
+                {
+                    "text": "我看了一下登录页面的样式。",
+                    "completed_at": 1_700_000_010.0,
+                    "tools": [
+                        {
+                            "tool": "bash",
+                            "status": "completed",
+                            "input_excerpt": "ls -la",
+                        },
+                    ],
+                },
+                {
+                    "text": "改好了。",
+                    "completed_at": 1_700_000_020.0,
+                    "tools": [
+                        {
+                            "tool": "edit",
+                            "status": "completed",
+                            "input_excerpt": "login.css",
+                        },
+                        {
+                            "tool": "bash",
+                            "status": "completed",
+                            "input_excerpt": "pytest",
+                        },
+                    ],
+                },
+            ],
+            "active_session_id": "ses_xyz",
+        },
+    }
+
+    from docx import Document
+    doc = Document(_render_docx_result(result))
+    all_text = "\n".join(p.text for p in doc.paragraphs)
+
+    # Summary, agent text, and tool excerpts all present and on their own lines
+    assert "Agent reported TASK COMPLETE" in all_text
+    assert "我看了一下登录页面的样式" in all_text
+    assert "改好了" in all_text
+    assert "bash" in all_text
+    assert "edit" in all_text
+    assert "login.css" in all_text
+
+    # "Agent 执行轨迹" section heading present
+    headings = [p.text for p in doc.paragraphs if p.style.name.startswith("Heading")]
+    assert any("Agent 执行轨迹" in h for h in headings)
+
+    # Tool lines are separate paragraphs from the agent text (not concatenated)
+    agent_paras = [p.text for p in doc.paragraphs if p.text and not p.style.name.startswith("Heading")]
+    tool_paras = [t for t in agent_paras if t.lstrip().startswith(("✓", "▶", "…", "✗", "•"))]
+    assert len(tool_paras) >= 3, f"expected tool lines as separate paragraphs, got {tool_paras}"
+
+
+def test_docx_result_handles_failed_status_heading() -> None:
+    from openloom_connector.runner import _render_docx_result
+
+    doc = _render_docx_result({
+        "status": "failed",
+        "task_name": "broken task",
+        "task_id": "task_x",
+        "timestamp": 0,
+        "data": {},
+    })
+    from docx import Document
+    d = Document(doc)
+    headings = [p.text for p in d.paragraphs if p.style.name.startswith("Heading")]
+    assert "任务失败报告" in headings
+
+
+def test_docx_result_no_recent_activity_omits_trace_section() -> None:
+    from openloom_connector.runner import _render_docx_result
+
+    doc = _render_docx_result({
+        "status": "completed",
+        "task_name": "minimal task",
+        "task_id": "task_y",
+        "timestamp": 1_700_000_000.0,
+        "data": {"summary": "ok"},
+    })
+    from docx import Document
+    d = Document(doc)
+    headings = [p.text for p in d.paragraphs if p.style.name.startswith("Heading")]
+    assert not any("Agent 执行轨迹" in h for h in headings)
+
+
+def test_docx_result_truncates_long_metadata() -> None:
+    """Tool input_excerpt longer than 200 chars gets truncated with ellipsis."""
+    from openloom_connector.runner import _truncate_text
+
+    s = "a" * 500
+    out = _truncate_text(s, 200)
+    assert len(out) == 200
+    assert out.endswith("…")
 
 
 # ── webhook signing ─────────────────────────────────────────────────────
