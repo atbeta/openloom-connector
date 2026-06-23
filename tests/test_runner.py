@@ -472,14 +472,49 @@ def test_docx_result_no_recent_activity_omits_trace_section() -> None:
     assert not any("Agent 执行轨迹" in h for h in headings)
 
 
-def test_docx_result_truncates_long_metadata() -> None:
-    """Tool input_excerpt longer than 200 chars gets truncated with ellipsis."""
-    from openloom_connector.runner import _truncate_text
+def test_docx_result_does_not_truncate_long_metadata() -> None:
+    """Long tool input_excerpt and other metadata must be preserved in
+    full — the agent's execution trace is meaningful content, not a
+    summary. Word/WPS handle long-line wrap on the phone."""
+    long_input = "a" * 2000
+    from openloom_connector.runner import _render_docx_result
 
-    s = "a" * 500
-    out = _truncate_text(s, 200)
-    assert len(out) == 200
-    assert out.endswith("…")
+    result = {
+        "status": "completed",
+        "task_name": "long task",
+        "task_id": "task_long",
+        "timestamp": 1_700_000_000.0,
+        "data": {
+            "summary": "done",
+            "recent_activity": [
+                {
+                    "text": "ran a big command",
+                    "completed_at": 1_700_000_010.0,
+                    "tools": [
+                        {
+                            "tool": "bash",
+                            "status": "completed",
+                            "input_excerpt": long_input,
+                        },
+                    ],
+                },
+            ],
+            "active_session_id": long_input,
+        },
+    }
+    from docx import Document
+    doc = Document(_render_docx_result(result))
+    all_text = "\n".join(p.text for p in doc.paragraphs)
+    assert long_input in all_text, "tool input_excerpt should be preserved verbatim"
+    # Also verify the leftover metadata block carries the full session id
+    # (it lives in a table, not a paragraph).
+    table_text = "\n".join(
+        cell.text
+        for table in doc.tables
+        for row in table.rows
+        for cell in row.cells
+    )
+    assert long_input in table_text, "active_session_id should be preserved verbatim"
 
 
 # ── webhook signing ─────────────────────────────────────────────────────

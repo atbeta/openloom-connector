@@ -464,7 +464,7 @@ _STATUS_HEADING = {
 def _render_docx_result(result: dict[str, Any]) -> io.BytesIO:
     """Render a result as a structured docx for phone-friendly reading.
 
-    Layout (three sections):
+    Layout (four sections):
 
       1. Header — task_name + status (heading) + timestamp
       2. Summary — the agent's ``summary`` text (one paragraph)
@@ -474,6 +474,9 @@ def _render_docx_result(result: dict[str, Any]) -> io.BytesIO:
          prose so they do not mix into the agent's narrative.
       4. Metadata — anything left over (e.g. active_session_id) in a
          small two-column table.
+
+    All content is preserved verbatim — no truncation. Long lines
+    wrap naturally in Word / WPS on the phone.
     """
     from docx import Document
 
@@ -507,7 +510,7 @@ def _render_docx_result(result: dict[str, Any]) -> io.BytesIO:
             for k, v in leftover.items():
                 row = table.add_row().cells
                 row[0].text = str(k)
-                row[1].text = _truncate_text(str(v), 400)
+                row[1].text = str(v)
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -593,7 +596,7 @@ def _docx_add_tool_line(doc: Any, tool: dict[str, Any]) -> None:
     name = str(tool.get("tool") or tool.get("name") or "tool")
     status = str(tool.get("status") or "unknown").lower()
     glyph = _TOOL_STATUS_GLYPH.get(status, "•")
-    excerpt = _truncate_text(str(tool.get("input_excerpt") or ""), 200)
+    excerpt = str(tool.get("input_excerpt") or "")
     line = f"    {glyph} {name} [{status}]"
     if excerpt:
         line += f"  {excerpt}"
@@ -608,12 +611,6 @@ def _docx_leftover(data: dict[str, Any]) -> dict[str, Any]:
     """Return data keys that were not already promoted to a section."""
     used = {"summary", "recent_activity"}
     return {k: v for k, v in data.items() if k not in used}
-
-
-def _truncate_text(s: str, limit: int) -> str:
-    if len(s) <= limit:
-        return s
-    return s[: max(0, limit - 1)] + "…"
 
 
 # ── legacy helpers (kept for callers that still depend on the flatten table) ─
