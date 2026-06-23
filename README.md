@@ -208,12 +208,16 @@ Only files whose name starts with `task-` (configurable via `task_prefix`) are p
 inbox/task-001.json  ─poll (every 10s)→  download → parse → POST /api/webhooks/generic
                                                                     ↓ OpenLoom creates task
                                                                     ↓ agent runs
-                                                                    ↓ task completes
                                   ┌──── POST /listener/openloom (OpenLoom outbound)
                                   │           ↓
                                   │     receiver decodes event
                                   │           ↓
-                                  │     write_result() ──→ outbox/task-001.result.json
+                                  │     TASK_UPDATED → write_status() ──→ outbox/task-001.status.json
+                                  │           ↓ (throttled to once per 30s;
+                                  │              transitions + terminals always go through)
+                                  │     TASK_COMPLETED / TASK_FAILED → write_result()
+                                  │           ↓
+                                  │           ──→ outbox/task-001.result.json
                                   │           ↓
                                   │     delete_inbox / archive
 inbox/task-001.json  ─delete─  consumed input cleared
@@ -225,6 +229,18 @@ the outbound webhook (see [`outbound_webhook`](#outbound-webhook-config)
 below), the connector never finds out when a task finishes — the result
 file in `outbox/` will never appear. Enable the receiver and point
 OpenLoom at it for the full lifecycle.
+
+Two output files per task:
+
+| File | When written | Format | Purpose |
+|------|--------------|--------|---------|
+| `outbox/task-001.status.json` | Every TASK_UPDATED, throttled to 30 s, plus every status transition and every terminal event | Always JSON | Lightweight live status — what the phone polls. Lets you see "agent is running" / "agent is blocked" without waiting for the terminal result. |
+| `outbox/task-001.result.{json,yaml,docx}` | Once, on TASK_COMPLETED / TASK_FAILED | Mirrors the input format | Rich terminal report — agent summary, recent activity, tool calls. |
+
+If you only care about the terminal outcome you can ignore the status
+files; if you want a live view (especially when the agent is stuck on a
+question or a tool failure), open the status file in your cloud
+storage's preview pane.
 
 ## Configuration reference
 

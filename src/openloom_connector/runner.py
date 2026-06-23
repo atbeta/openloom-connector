@@ -45,6 +45,15 @@ _RESULT_SUFFIX_BY_EXT = {
     ".docx": ".result.docx",
 }
 
+# Minimum seconds between two consecutive status writes for the
+# same task when the status has not changed. OpenLoom emits
+# TASK_UPDATED every 8 seconds; without throttling the storage
+# layer would see a write per tick per task, which on a 5-minute
+# long task and a synced cloud drive makes the phone jitter.
+# Transitions (status string actually changed) and terminal events
+# always write regardless of this interval.
+STATUS_MIN_INTERVAL_S = 30.0
+
 
 class Runner:
     """Poll-and-forward runner — orchestrates a Connector with OpenLoom."""
@@ -55,6 +64,14 @@ class Runner:
         self._seen: set[str] = set()
         self._task_to_file: dict[str, str] = {}
         self._stopped = asyncio.Event()
+        # Per-task throttle + change detection for status writes.
+        # _last_status[task_id] = (status_string, epoch_seconds).
+        # We always write on a status *transition*; while the status
+        # stays the same we throttle to STATUS_MIN_INTERVAL_S to
+        # keep the storage layer from getting hammered on every
+        # 8-second OpenLoom tick.
+        self._last_status: dict[str, tuple[str, float]] = {}
+        self._status_seq: int = 0
         # Held so the receiver coroutine can call ``shutdown()`` from another
         # thread when the runner is asked to stop. ``None`` while the receiver
         # is not running.
@@ -176,49 +193,13 @@ class Runner:
                     _logger.warning("receiver: invalid body: %s", exc)
                     self.send_error(400, "invalid json")
                     return
-
-                event_name = str(event.get("event") or "")
-                task_id = str(event.get("task_id") or "")
-                if not event_name or not task_id:
-                    _logger.warning(
-                        "receiver: missing event/task_id: %r", event,
-                    )
-                    self.send_error(400, "missing event or task_id")
-                    return
-
-                # Only terminal events trigger write_result. Everything else is
-                # acknowledged but ignored -- we just don't have anything to
-                # write back yet.
-                if event_name not in ("TASK_COMPLETED", "TASK_FAILED"):
-                    _logger.debug(
-                        "receiver: ignoring event %s for %s", event_name, task_id,
-                    )
-                    self._ok({"ok": True, "ignored": event_name})
-                    return
-
-                if task_id not in runner_ref._task_to_file:
-                    _logger.info(
-                        "receiver: %s for unknown task %s -- nothing to write",
-                        event_name, task_id,
-                    )
-                    self._ok({"ok": True, "ignored": "unknown task"})
-                    return
-
-                data = event.get("data") or {}
-                task_name = str(event.get("task_name") or "")
-                # event_name is one of TASK_COMPLETED / TASK_FAILED here
-                status = str(data.get("status") or event_name[len("TASK_"):].lower())
                 try:
-                    runner_ref.write_result(
-                        task_id=task_id,
-                        task_name=task_name,
-                        status=status,
-                        data=data if isinstance(data, dict) else {"raw": data},
-                    )
-                    self._ok({"ok": True, "task_id": task_id, "status": status})
+                    outcome = runner_ref.handle_event(event)
                 except Exception as exc:
-                    _logger.exception("write_result failed for %s", task_id)
-                    self.send_error(500, f"write_result failed: {exc}")
+                    _logger.exception("handle_event failed: %s", exc)
+                    self.send_error(500, f"handle_event failed: {exc}")
+                    return
+                self._ok({"ok": True, **outcome})
 
             def _ok(self, body: dict[str, Any]) -> None:
                 payload = json.dumps(body).encode("utf-8")
@@ -231,6 +212,133 @@ class Runner:
         # ThreadingHTTPServer handles one request per thread, so a slow
         # write_result cannot block subsequent events.
         return ThreadingHTTPServer((cfg.host, cfg.port), _Handler)
+
+    # ── event handling (used by the HTTP receiver) ─────────────────────
+
+    def handle_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        """Dispatch one decoded OpenLoom event to the right writer.
+
+        Terminal events (TASK_COMPLETED / TASK_FAILED) trigger the
+        full ``write_result`` flow that produces the rich result
+        document. Intermediate TASK_UPDATED events are throttled and
+        only written when the task's status has changed or the
+        throttle window has elapsed, so the phone never sees the
+        document jitter on every 8-second tick.
+
+        Returns a small dict that the HTTP receiver turns into the
+        200 JSON body — useful when reading logs.
+        """
+        event_name = str(event.get("event") or "")
+        task_id = str(event.get("task_id") or "")
+        if not event_name or not task_id:
+            raise ValueError("missing event or task_id")
+
+        data = event.get("data") or {}
+        if not isinstance(data, dict):
+            data = {"raw": data}
+        task_name = str(event.get("task_name") or "")
+        status = str(
+            data.get("status")
+            or (event_name[len("TASK_"):].lower() if event_name.startswith("TASK_") else ""),
+        )
+
+        if event_name in ("TASK_COMPLETED", "TASK_FAILED"):
+            if task_id not in self._task_to_file:
+                _logger.info(
+                    "receiver: %s for unknown task %s -- nothing to write",
+                    event_name, task_id,
+                )
+                return {"task_id": task_id, "action": "ignored_unknown_task"}
+            self.write_result(
+                task_id=task_id,
+                task_name=task_name,
+                status=status,
+                data=data,
+            )
+            return {
+                "task_id": task_id,
+                "action": "result_written",
+                "status": status,
+            }
+
+        # Intermediate events: TASK_UPDATED etc.
+        # Only act on tasks we own; otherwise OpenLoom may be
+        # emitting for tasks started outside the connector path.
+        if task_id not in self._task_to_file:
+            _logger.debug(
+                "receiver: ignoring %s for unknown task %s",
+                event_name, task_id,
+            )
+            return {"task_id": task_id, "action": "ignored_unknown_task"}
+
+        self._maybe_write_status(
+            task_id=task_id,
+            task_name=task_name,
+            status=status or "running",
+            data=data,
+            now=time.time(),
+        )
+        return {"task_id": task_id, "action": "status_written", "status": status}
+
+    def _maybe_write_status(
+        self,
+        *,
+        task_id: str,
+        task_name: str,
+        status: str,
+        data: dict[str, Any],
+        now: float,
+    ) -> bool:
+        """Write a lightweight status file when status changed or the
+        throttle window has elapsed. Returns whether a write happened."""
+        last = self._last_status.get(task_id)
+        status_changed = last is None or last[0] != status
+        throttle_expired = last is None or (now - last[1]) >= STATUS_MIN_INTERVAL_S
+
+        if not status_changed and not throttle_expired:
+            _logger.debug(
+                "status: skipping write for %s (status=%s, last=%.1fs ago)",
+                task_id, status, now - last[1],
+            )
+            return False
+
+        source_file = self._task_to_file.get(task_id)
+        if source_file is None:
+            return False
+
+        out_name = _status_filename(source_file)
+        out_path = f"{self._config.outbox_dir}/{out_name}"
+
+        active_session_id = ""
+        if isinstance(data, dict):
+            active_session_id = str(data.get("active_session_id") or "")
+
+        payload = {
+            "schema_version": "1.0",
+            "task_id": task_id,
+            "task_name": task_name,
+            "status": status,
+            "timestamp": now,
+            "timestamp_iso": _iso_utc(now),
+            "summary": str(data.get("summary") or ""),
+            "active_session_id": active_session_id or None,
+        }
+        try:
+            self._connector.upload(
+                out_path,
+                json.dumps(payload, ensure_ascii=False, indent=2).encode(),
+            )
+            self._status_seq += 1
+            self._last_status[task_id] = (status, now)
+            _logger.info(
+                "status: wrote %s for %s (status=%s, reason=%s)",
+                out_path, task_id, status,
+                "changed" if status_changed else "throttle_expired",
+            )
+            return True
+        except Exception:
+            _logger.exception("status upload failed for %s", out_path)
+            return False
 
     # ── poll cycle ──────────────────────────────────────────────────────
 
@@ -651,3 +759,25 @@ def _sign_payload(secret: str, payload: bytes) -> str:
 
 def _strip_prefix(name: str, prefix: str) -> str:
     return name[len(prefix):] if name.startswith(prefix) else name
+
+
+def _iso_utc(epoch: float) -> str:
+    """Format an epoch second as an ISO-8601 UTC string with Z suffix."""
+    from datetime import UTC, datetime
+    return datetime.fromtimestamp(epoch, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _status_filename(source_file: str) -> str:
+    """Map an inbox task filename to its status-file name.
+
+    Status files are always JSON regardless of the input format —
+    they are an internal lightweight progress signal, not a
+    user-facing artifact like the terminal ``.result.docx``.
+    Names are stable so the phone can poll a single path.
+
+    ``task-fix.json``    -> ``task-fix.status.json``
+    ``task-deploy.yaml`` -> ``task-deploy.status.json``
+    ``task-readme.docx`` -> ``task-readme.status.json``
+    """
+    stem = PurePosixPath(source_file).stem
+    return f"{stem}.status.json"

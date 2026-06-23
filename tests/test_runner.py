@@ -6,6 +6,7 @@ import io
 import json
 import socket
 import threading
+import time
 from contextlib import contextmanager
 from typing import Any
 
@@ -695,34 +696,140 @@ def test_receiver_ignores_unknown_task() -> None:
                 json={"event": "TASK_COMPLETED", "task_id": "ghost", "data": {}},
             )
         assert r.status_code == 200
-        assert r.json()["ignored"] == "unknown task"
+        assert r.json()["action"] == "ignored_unknown_task"
         assert conn.files == {}
 
 
-def test_receiver_ignores_non_terminal_events() -> None:
+def test_receiver_writes_status_file_on_task_updated() -> None:
+    """TASK_UPDATED with a non-terminal status now writes a lightweight
+    ``task-x.status.json`` so a phone connected via cloud storage can
+    see the agent's live status — previously the receiver ignored
+    intermediate events entirely and the phone only learned about
+    the task on the terminal event."""
     conn = InMemoryConnector()
-    conn.files["/inbox/task-t.json"] = json.dumps({"goal": "x", "workspace": "/p"}).encode()
+    conn.files["/inbox/task-t.json"] = json.dumps({
+        "goal": "x", "workspace": "/p",
+    }).encode()
+    runner = Runner(_receiver_config())
+    runner._connector = conn
+    runner._task_to_file["task_xyz"] = "/inbox/task-t.json"
+    runner._seen.add("/inbox/task-t.json")
+
+    with _running_server(runner) as port:
+        with httpx.Client(timeout=5.0) as client:
+            r = client.post(
+                f"http://127.0.0.1:{port}/listener/openloom",
+                json={
+                    "event": "TASK_UPDATED",
+                    "task_id": "task_xyz",
+                    "task_name": "demo",
+                    "data": {"status": "running", "summary": "Agent is busy",
+                             "active_session_id": "ses_1"},
+                },
+            )
+        assert r.status_code == 200, r.text
+        assert r.json()["action"] == "status_written"
+        assert r.json()["status"] == "running"
+
+    # Status file written, result file NOT yet (terminal event hasn't fired)
+    out_files = [p for p in conn.files if p.startswith("/outbox/")]
+    assert out_files == ["/outbox/task-t.status.json"]
+    payload = json.loads(conn.files["/outbox/task-t.status.json"])
+    assert payload["status"] == "running"
+    assert payload["task_id"] == "task_xyz"
+    assert payload["active_session_id"] == "ses_1"
+    assert payload["schema_version"] == "1.0"
+    assert "timestamp" in payload
+    assert "timestamp_iso" in payload
+    # Input still in inbox (write_result only fires on terminal events)
+    assert "/inbox/task-t.json" in conn.files
+
+
+def test_receiver_throttles_repeated_task_updated() -> None:
+    """Same status repeated within STATUS_MIN_INTERVAL_S does not
+    re-write the file — the phone never sees a status file jitter
+    on every OpenLoom tick. Status transitions and terminal events
+    always write through."""
+    conn = InMemoryConnector()
+    conn.files["/inbox/task-t.json"] = json.dumps({
+        "goal": "x", "workspace": "/p",
+    }).encode()
     runner = Runner(_receiver_config())
     runner._connector = conn
     runner._task_to_file["task_xyz"] = "/inbox/task-t.json"
 
+    upload_calls: list[str] = []
+
+    real_upload = conn.upload
+
+    def _tracking_upload(path: str, content: bytes) -> None:
+        upload_calls.append(path)
+        real_upload(path, content)
+
+    conn.upload = _tracking_upload  # type: ignore[method-assign]
+
+    def _post_event(client: httpx.Client, port: int, status: str) -> dict[str, Any]:
+        return client.post(
+            f"http://127.0.0.1:{port}/listener/openloom",
+            json={
+                "event": "TASK_UPDATED",
+                "task_id": "task_xyz",
+                "task_name": "demo",
+                "data": {"status": status},
+            },
+        ).json()
+
     with _running_server(runner) as port:
         with httpx.Client(timeout=5.0) as client:
-            for event_name in ("TASK_CREATED", "TASK_STARTED", "TASK_UPDATED"):
-                r = client.post(
-                    f"http://127.0.0.1:{port}/listener/openloom",
-                    json={
-                        "event": event_name,
-                        "task_id": "task_xyz",
-                        "data": {"status": "running"},
-                    },
-                )
-                assert r.status_code == 200
-                assert r.json()["ignored"] == event_name
-        # No result file written yet
-        assert not any(p.startswith("/outbox/") for p in conn.files)
-        # Input still in place (write_result only fires on terminal events)
-        assert "/inbox/task-t.json" in conn.files
+            first = _post_event(client, port, "running")
+            second = _post_event(client, port, "running")  # same status, throttled
+            third = _post_event(client, port, "waiting")   # status changed → write
+
+    # All three HTTP calls succeed; the dispatch is cheap.
+    for r in (first, second, third):
+        assert r["action"] == "status_written"
+
+    # But the underlying upload fired only twice — first write
+    # (status=running) and the transition (status=waiting). The
+    # second call (still 'running') was throttled.
+    status_uploads = [p for p in upload_calls if "status.json" in p]
+    assert len(status_uploads) == 2, status_uploads
+
+    # The latest content reflects the transition.
+    payload = json.loads(conn.files["/outbox/task-t.status.json"])
+    assert payload["status"] == "waiting"
+
+
+def test_receiver_status_written_on_blocked_transition() -> None:
+    """A task that transitions into ``waiting`` (e.g. permission prompt,
+    even though we now auto-accept — this also covers external blocks)
+    must always be written, regardless of the throttle window."""
+    conn = InMemoryConnector()
+    conn.files["/inbox/task-t.json"] = json.dumps({
+        "goal": "x", "workspace": "/p",
+    }).encode()
+    runner = Runner(_receiver_config())
+    runner._connector = conn
+    runner._task_to_file["task_xyz"] = "/inbox/task-t.json"
+    runner._last_status["task_xyz"] = ("running", time.time())  # recent
+
+    with _running_server(runner) as port:
+        with httpx.Client(timeout=5.0) as client:
+            r = client.post(
+                f"http://127.0.0.1:{port}/listener/openloom",
+                json={
+                    "event": "TASK_UPDATED",
+                    "task_id": "task_xyz",
+                    "task_name": "demo",
+                    "data": {"status": "waiting", "summary": "blocked"},
+                },
+            )
+        assert r.json()["action"] == "status_written"
+
+    assert "/outbox/task-t.status.json" in conn.files
+    payload = json.loads(conn.files["/outbox/task-t.status.json"])
+    assert payload["status"] == "waiting"
+    assert payload["summary"] == "blocked"
 
 
 def test_receiver_404_on_wrong_path() -> None:
