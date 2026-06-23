@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import io
 import json
+import socket
+import threading
+from contextlib import contextmanager
 from typing import Any
 
 import httpx
@@ -11,7 +14,11 @@ import pytest
 import respx
 
 from openloom_connector import Connector, FileEntry
-from openloom_connector.config import ConnectorConfig, WebhookSource
+from openloom_connector.config import (
+    ConnectorConfig,
+    OutboundWebhookConfig,
+    WebhookSource,
+)
 from openloom_connector.runner import Runner, _parse_docx, _parse_spec
 
 
@@ -417,6 +424,9 @@ async def test_run_loop_stops_on_signal() -> None:
     await asyncio.gather(runner.run(), stop_soon())
 
 
+# ── trust_env=False (httpx proxy hardening) ──────────────────────────────────
+
+
 def test_push_ignores_system_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
     """If HTTP_PROXY is set, the connector must still POST directly to
     127.0.0.1. Regression test for the 'Content Filter - Access Denied'
@@ -440,3 +450,199 @@ def test_push_ignores_system_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
         runner._poll_once()
 
     assert route.call_count == 1
+
+
+# ── outbound webhook receiver ───────────────────────────────────────────────
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+@contextmanager
+def _running_server(runner: Runner):
+    """Start a receiver server in a background thread and yield its port.
+
+    The thread is joined and the listening socket is closed on exit. Use
+    this in every receiver test that issues real HTTP requests — building
+    the server alone does not call ``accept()``.
+    """
+    server = runner._build_receiver_server()
+    runner._receiver_server = server  # mirrors what ``run()`` sets
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server.server_address[1]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        runner._receiver_server = None
+
+
+def _receiver_config(**kwargs: Any) -> ConnectorConfig:
+    port = _free_port()
+    return ConnectorConfig(
+        connector_class=InMemoryConnector,
+        connector_kwargs={},
+        openloom_url="http://loom:55413",
+        webhook=WebhookSource(url="http://loom:55413/api/webhooks/generic"),
+        inbox_dir=kwargs.get("inbox_dir", "/inbox"),
+        outbox_dir=kwargs.get("outbox_dir", "/outbox"),
+        archive_dir=kwargs.get("archive_dir", ""),
+        poll_interval_seconds=0,
+        task_prefix=kwargs.get("task_prefix", "task-"),
+        outbound=OutboundWebhookConfig(
+            enabled=True,
+            host="127.0.0.1",
+            port=port,
+            path="/listener/openloom",
+        ),
+    )
+
+
+def test_receiver_writes_result_on_task_completed() -> None:
+    conn = InMemoryConnector()
+    conn.files["/inbox/task-t.json"] = json.dumps({
+        "goal": "fix bug", "workspace": "/p",
+    }).encode()
+    runner = Runner(_receiver_config())
+    runner._connector = conn
+
+    with _running_server(runner) as port:
+        runner._task_to_file["task_xyz"] = "/inbox/task-t.json"
+        runner._seen.add("/inbox/task-t.json")
+
+        payload = {
+            "event": "TASK_COMPLETED",
+            "task_id": "task_xyz",
+            "task_name": "fix bug",
+            "data": {"status": "completed", "summary": "done"},
+        }
+        with httpx.Client(timeout=5.0) as client:
+            r = client.post(
+                f"http://127.0.0.1:{port}/listener/openloom",
+                json=payload,
+            )
+        assert r.status_code == 200, r.text
+        assert r.json()["ok"] is True
+
+        out_files = [p for p in conn.files if p.startswith("/outbox/")]
+        assert out_files == ["/outbox/task-t.result.json"]
+        result = json.loads(conn.files["/outbox/task-t.result.json"])
+        assert result["task_id"] == "task_xyz"
+        assert result["status"] == "completed"
+        assert "/inbox/task-t.json" not in conn.files
+
+
+def test_receiver_ignores_unknown_task() -> None:
+    conn = InMemoryConnector()
+    runner = Runner(_receiver_config())
+    runner._connector = conn
+
+    with _running_server(runner) as port:
+        with httpx.Client(timeout=5.0) as client:
+            r = client.post(
+                f"http://127.0.0.1:{port}/listener/openloom",
+                json={"event": "TASK_COMPLETED", "task_id": "ghost", "data": {}},
+            )
+        assert r.status_code == 200
+        assert r.json()["ignored"] == "unknown task"
+        assert conn.files == {}
+
+
+def test_receiver_ignores_non_terminal_events() -> None:
+    conn = InMemoryConnector()
+    conn.files["/inbox/task-t.json"] = json.dumps({"goal": "x", "workspace": "/p"}).encode()
+    runner = Runner(_receiver_config())
+    runner._connector = conn
+    runner._task_to_file["task_xyz"] = "/inbox/task-t.json"
+
+    with _running_server(runner) as port:
+        with httpx.Client(timeout=5.0) as client:
+            for event_name in ("TASK_CREATED", "TASK_STARTED", "TASK_UPDATED"):
+                r = client.post(
+                    f"http://127.0.0.1:{port}/listener/openloom",
+                    json={
+                        "event": event_name,
+                        "task_id": "task_xyz",
+                        "data": {"status": "running"},
+                    },
+                )
+                assert r.status_code == 200
+                assert r.json()["ignored"] == event_name
+        # No result file written yet
+        assert not any(p.startswith("/outbox/") for p in conn.files)
+        # Input still in place (write_result only fires on terminal events)
+        assert "/inbox/task-t.json" in conn.files
+
+
+def test_receiver_404_on_wrong_path() -> None:
+    conn = InMemoryConnector()
+    runner = Runner(_receiver_config())
+    runner._connector = conn
+
+    with _running_server(runner) as port:
+        with httpx.Client(timeout=5.0) as client:
+            r = client.post(
+                f"http://127.0.0.1:{port}/wrong-path",
+                json={"event": "TASK_COMPLETED", "task_id": "x"},
+            )
+        assert r.status_code == 404
+
+
+def test_receiver_400_on_invalid_body() -> None:
+    conn = InMemoryConnector()
+    runner = Runner(_receiver_config())
+    runner._connector = conn
+
+    with _running_server(runner) as port:
+        with httpx.Client(timeout=5.0) as client:
+            r = client.post(
+                f"http://127.0.0.1:{port}/listener/openloom",
+                content=b"not json",
+            )
+        assert r.status_code == 400
+
+
+async def test_run_with_receiver_starts_and_stops() -> None:
+    """Integration smoke: run() with receiver enabled must accept a real
+    inbound HTTP request, and stop() must shut down the receiver thread."""
+    import asyncio
+
+    conn = InMemoryConnector()
+    conn.files["/inbox/task-t.json"] = json.dumps({
+        "goal": "x", "workspace": "/p",
+    }).encode()
+    runner = Runner(_receiver_config())
+    runner._connector = conn
+    port = runner._config.outbound.port
+
+    async def driver() -> None:
+        # Wait for the server to bind, then poke it.
+        for _ in range(50):
+            try:
+                with httpx.Client(timeout=1.0) as c:
+                    r = c.post(
+                        f"http://127.0.0.1:{port}/listener/openloom",
+                        json={
+                            "event": "TASK_COMPLETED",
+                            "task_id": "will-be-ignored",
+                            "data": {"status": "completed"},
+                        },
+                    )
+                assert r.status_code == 200
+                return
+            except Exception:
+                await asyncio.sleep(0.05)
+        raise AssertionError("receiver never came up")
+
+    runner_task = asyncio.create_task(runner.run())
+    try:
+        await driver()
+    finally:
+        runner.stop()
+        await asyncio.wait_for(runner_task, timeout=5.0)
+    assert runner._receiver_server is None

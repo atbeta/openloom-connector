@@ -22,6 +22,23 @@ class WebhookSource:
 
 
 @dataclass(frozen=True)
+class OutboundWebhookConfig:
+    """Inbound listener for OpenLoom's outbound webhook events.
+
+    When OpenLoom task lifecycle changes (TASK_COMPLETED / TASK_FAILED /
+    TASK_UPDATED …) it POSTs a JSON event. The connector exposes this
+    tiny HTTP server to receive those events and call ``write_result``
+    for completed tasks. Without this, the connector can only push
+    tasks — it never learns when they finish.
+    """
+
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = 55414
+    path: str = "/listener/openloom"
+
+
+@dataclass(frozen=True)
 class ConnectorConfig:
     """Resolved connector configuration."""
 
@@ -38,6 +55,9 @@ class ConnectorConfig:
     state_path: Path | None = None
     task_prefix: str = "task-"
     result_suffix: str = ".result"
+    outbound: OutboundWebhookConfig = field(
+        default_factory=OutboundWebhookConfig,
+    )
 
 
 def load_config(path: str | Path) -> ConnectorConfig:
@@ -113,6 +133,17 @@ def load_config(path: str | Path) -> ConnectorConfig:
     state_raw = raw.get("state_path")
     state_path = Path(state_raw).expanduser() if state_raw else None
 
+    outbound_raw = raw.get("outbound_webhook") or {}
+    if not isinstance(outbound_raw, dict):
+        raise ValueError("'outbound_webhook' must be a mapping")
+    outbound_enabled = bool(outbound_raw.get("enabled", False))
+    outbound = OutboundWebhookConfig(
+        enabled=outbound_enabled,
+        host=str(outbound_raw.get("host") or "127.0.0.1"),
+        port=int(outbound_raw.get("port") or 55414),
+        path=str(outbound_raw.get("path") or "/listener/openloom"),
+    )
+
     return ConnectorConfig(
         connector_class=cls,
         connector_kwargs=kwargs,
@@ -125,6 +156,7 @@ def load_config(path: str | Path) -> ConnectorConfig:
         state_path=state_path,
         task_prefix=task_prefix,
         result_suffix=result_suffix,
+        outbound=outbound,
     )
 
 

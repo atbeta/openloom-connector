@@ -23,6 +23,7 @@ import io
 import json
 import logging
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -54,12 +55,23 @@ class Runner:
         self._seen: set[str] = set()
         self._task_to_file: dict[str, str] = {}
         self._stopped = asyncio.Event()
+        # Held so the receiver coroutine can call ``shutdown()`` from another
+        # thread when the runner is asked to stop. ``None`` while the receiver
+        # is not running.
+        self._receiver_server: ThreadingHTTPServer | None = None
 
     def stop(self) -> None:
         self._stopped.set()
+        # Tell the blocking serve_forever thread to return. shutdown() is
+        # safe to call from any thread and must be invoked after stop() for
+        # ``run()`` to exit cleanly when the receiver is enabled.
+        server = self._receiver_server
+        if server is not None:
+            server.shutdown()
 
     async def run(self) -> None:
-        """Run the polling loop until ``stop()`` is called."""
+        """Run the polling loop (and outbound receiver if enabled) until
+        ``stop()`` is called."""
         _logger.info(
             "connector started — polling every %ds, prefix=%r",
             self._config.poll_interval_seconds,
@@ -70,12 +82,46 @@ class Runner:
         _logger.info("inbox:        %s", self._config.inbox_dir)
         _logger.info("archive:      %s", self._config.archive_dir or "(disabled)")
 
+        tasks: list[asyncio.Task[Any]] = [
+            asyncio.create_task(self._poll_loop(), name="openloom-connector-poll"),
+        ]
+        if self._config.outbound.enabled:
+            _logger.info(
+                "receiver:     http://%s:%d%s (OpenLoom -> connector)",
+                self._config.outbound.host,
+                self._config.outbound.port,
+                self._config.outbound.path,
+            )
+            tasks.append(
+                asyncio.create_task(
+                    self._receiver_loop(), name="openloom-connector-receiver",
+                )
+            )
+        else:
+            _logger.info(
+                "receiver:     disabled (set outbound_webhook.enabled: true to "
+                "listen for task completion events)",
+            )
+
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            for t in tasks:
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+    async def _poll_loop(self) -> None:
+        """Inbox polling loop, separated so ``run()`` can ``gather`` it."""
         while not self._stopped.is_set():
             try:
                 self._poll_once()
             except Exception:
                 _logger.exception("poll cycle failed")
-
             try:
                 await asyncio.wait_for(
                     self._stopped.wait(),
@@ -83,6 +129,108 @@ class Runner:
                 )
             except TimeoutError:
                 pass
+
+    # --- outbound webhook receiver ------------------------------------------
+    #
+    # OpenLoom's outbound webhook posts a JSON event for every task lifecycle
+    # change. We only care about terminal events (TASK_COMPLETED / TASK_FAILED)
+    # because they trigger result write-back. Intermediate TASK_UPDATED events
+    # are accepted (logged) but do not produce a result file.
+    #
+    # The receiver runs in a thread (stdlib http.server is blocking) inside an
+    # asyncio task via ``asyncio.to_thread``. The handler invokes
+    # ``write_result`` synchronously -- which is fine because all of its work
+    # is short-lived Connector I/O and it does not touch the asyncio loop.
+
+    async def _receiver_loop(self) -> None:
+        server = self._build_receiver_server()
+        self._receiver_server = server
+        try:
+            await asyncio.to_thread(server.serve_forever)
+        except Exception:
+            _logger.exception("receiver crashed")
+            raise
+        finally:
+            self._receiver_server = None
+            server.server_close()
+
+    def _build_receiver_server(self) -> ThreadingHTTPServer:
+        cfg = self._config.outbound
+        runner_ref = self
+
+        class _Handler(BaseHTTPRequestHandler):
+            # Quieter logs -- BaseHTTPRequestHandler logs every request to
+            # stderr by default, which is noisy when OpenLoom polls every 8s.
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                _logger.debug("receiver " + format, *args)
+
+            def do_POST(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
+                if self.path != cfg.path:
+                    self.send_error(404, "unknown path")
+                    return
+                length = int(self.headers.get("Content-Length") or 0)
+                try:
+                    raw = self.rfile.read(length) if length else b""
+                    event = json.loads(raw.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError) as exc:
+                    _logger.warning("receiver: invalid body: %s", exc)
+                    self.send_error(400, "invalid json")
+                    return
+
+                event_name = str(event.get("event") or "")
+                task_id = str(event.get("task_id") or "")
+                if not event_name or not task_id:
+                    _logger.warning(
+                        "receiver: missing event/task_id: %r", event,
+                    )
+                    self.send_error(400, "missing event or task_id")
+                    return
+
+                # Only terminal events trigger write_result. Everything else is
+                # acknowledged but ignored -- we just don't have anything to
+                # write back yet.
+                if event_name not in ("TASK_COMPLETED", "TASK_FAILED"):
+                    _logger.debug(
+                        "receiver: ignoring event %s for %s", event_name, task_id,
+                    )
+                    self._ok({"ok": True, "ignored": event_name})
+                    return
+
+                if task_id not in runner_ref._task_to_file:
+                    _logger.info(
+                        "receiver: %s for unknown task %s -- nothing to write",
+                        event_name, task_id,
+                    )
+                    self._ok({"ok": True, "ignored": "unknown task"})
+                    return
+
+                data = event.get("data") or {}
+                task_name = str(event.get("task_name") or "")
+                # event_name is one of TASK_COMPLETED / TASK_FAILED here
+                status = str(data.get("status") or event_name[len("TASK_"):].lower())
+                try:
+                    runner_ref.write_result(
+                        task_id=task_id,
+                        task_name=task_name,
+                        status=status,
+                        data=data if isinstance(data, dict) else {"raw": data},
+                    )
+                    self._ok({"ok": True, "task_id": task_id, "status": status})
+                except Exception as exc:
+                    _logger.exception("write_result failed for %s", task_id)
+                    self.send_error(500, f"write_result failed: {exc}")
+
+            def _ok(self, body: dict[str, Any]) -> None:
+                payload = json.dumps(body).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        # ThreadingHTTPServer handles one request per thread, so a slow
+        # write_result cannot block subsequent events.
+        return ThreadingHTTPServer((cfg.host, cfg.port), _Handler)
 
     # ── poll cycle ──────────────────────────────────────────────────────
 

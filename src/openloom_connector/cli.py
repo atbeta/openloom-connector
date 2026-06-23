@@ -76,6 +76,13 @@ def main() -> None:
         print(f"    inbox:      {config.inbox_dir}")
         print(f"    outbox:     {config.outbox_dir}")
         print(f"    poll:       {config.poll_interval_seconds}s")
+        if config.outbound.enabled:
+            print(
+                f"    receiver:   http://{config.outbound.host}:"
+                f"{config.outbound.port}{config.outbound.path}"
+            )
+        else:
+            print("    receiver:   disabled")
         return
 
     print(f"openloom-connector {__version__}")
@@ -114,6 +121,17 @@ paths:
   archive: ""                   # optional: archive consumed input files here
 
 poll_interval_seconds: 10
+
+# Inbound listener for OpenLoom's outbound webhook events (TASK_COMPLETED /
+# TASK_FAILED). Point OpenLoom's OPENLOOM_NOTIFY_WEBHOOK_URLS at this URL to
+# get task completion events pushed back into the connector so it can write
+# result files. Leave disabled to use the connector as a fire-and-forget task
+# submitter.
+outbound_webhook:
+  enabled: false
+  host: 127.0.0.1
+  port: 55414
+  path: /listener/openloom
 
 # state_path: .openloom-connector/state.json   # optional — local connector state
 """

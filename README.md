@@ -176,10 +176,22 @@ inbox/task-001.json  ─poll (every 10s)→  download → parse → POST /api/we
                                                                     ↓ OpenLoom creates task
                                                                     ↓ agent runs
                                                                     ↓ task completes
-outbox/task-001.result.json  ←upload─  format result
+                                  ┌──── POST /listener/openloom (OpenLoom outbound)
+                                  │           ↓
+                                  │     receiver decodes event
+                                  │           ↓
+                                  │     write_result() ──→ outbox/task-001.result.json
+                                  │           ↓
+                                  │     delete_inbox / archive
 inbox/task-001.json  ─delete─  consumed input cleared
                          (also archived to /archive if configured)
 ```
+
+The connector polls the inbox and pushes task files to OpenLoom. Without
+the outbound webhook (see [`outbound_webhook`](#outbound-webhook-config)
+below), the connector never finds out when a task finishes — the result
+file in `outbox/` will never appear. Enable the receiver and point
+OpenLoom at it for the full lifecycle.
 
 ## Configuration reference
 
@@ -197,6 +209,31 @@ inbox/task-001.json  ─delete─  consumed input cleared
 | `task_prefix` | `task-` | Files must start with this prefix to be processed |
 | `state_path` | `null` | Optional: path for connector-side state (e.g. cursor) |
 
+### Outbound webhook config
+
+The connector runs a tiny HTTP server that accepts completion events from
+OpenLoom's outbound webhook. Without this, the connector can only push
+tasks; it never learns when they finish.
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `outbound_webhook.enabled` | `false` | When `true`, the connector listens for completion events |
+| `outbound_webhook.host` | `127.0.0.1` | Bind address. Use `0.0.0.0` to accept events from a remote OpenLoom |
+| `outbound_webhook.port` | `55414` | Bind port |
+| `outbound_webhook.path` | `/listener/openloom` | URL path OpenLoom should POST to |
+
+Point OpenLoom at the receiver:
+
+```bash
+# In the OpenLoom process / container
+export OPENLOOM_NOTIFY_WEBHOOK_URLS='http://127.0.0.1:55414/listener/openloom'
+```
+
+Only `TASK_COMPLETED` and `TASK_FAILED` events trigger a result file.
+Intermediate events (`TASK_CREATED`, `TASK_STARTED`, `TASK_UPDATED`) are
+acknowledged and ignored — they only matter if you build a custom source
+that cares about progress.
+
 ## CLI reference
 
 ```bash
@@ -210,10 +247,21 @@ openloom-connector run -c path/to/yaml -v        # with DEBUG logging
 
 `openloom-connector` does **not** import from `openloom`. It talks to OpenLoom only through HTTP:
 
-- `POST /api/webhooks/{source}` — push tasks
-- (Future) `GET /api/events` SSE — listen for completion events
+- `POST /api/webhooks/{source}` — push tasks (outbound from connector)
+- `POST` to a local HTTP listener — receive task completion events (OpenLoom's outbound webhook)
+
+The HTTP listener uses Python's stdlib `http.server`, so no extra
+dependencies are pulled in. `asyncio.to_thread` keeps the blocking
+`serve_forever` loop out of the asyncio event loop.
 
 This keeps the connector lightweight and decoupled from OpenLoom internals. You can run multiple connectors (different backends) against one OpenLoom server.
+
+> **System proxy gotcha.** httpx honours `HTTP_PROXY` / `HTTPS_PROXY`
+> environment variables by default. If your machine has a system-wide
+> proxy (corporate VPN, Clash, mitmproxy, etc.) set, requests to
+> `127.0.0.1:55413` get routed through it and fail with `Content Filter -
+> Access Denied`. The connector passes `trust_env=False` to its httpx
+> client to avoid this.
 
 ## Development
 

@@ -123,4 +123,34 @@ connector:
 """)
     cfg = load_config(p)
     assert cfg.webhook.source == "github"
+
+
+def test_outbound_webhook_defaults(tmp_path: Path) -> None:
+    p = _write(tmp_path, """
+connector:
+  class: test_config.DummyConnector
+""")
+    cfg = load_config(p)
+    assert cfg.outbound.enabled is False
+    assert cfg.outbound.host == "127.0.0.1"
+    assert cfg.outbound.port == 55414
+    assert cfg.outbound.path == "/listener/openloom"
+
+
+def test_outbound_webhook_enabled(tmp_path: Path) -> None:
+    p = _write(tmp_path, """
+connector:
+  class: test_config.DummyConnector
+
+outbound_webhook:
+  enabled: true
+  host: 0.0.0.0
+  port: 9001
+  path: /events
+""")
+    cfg = load_config(p)
+    assert cfg.outbound.enabled is True
+    assert cfg.outbound.host == "0.0.0.0"
+    assert cfg.outbound.port == 9001
+    assert cfg.outbound.path == "/events"
     assert cfg.webhook.url.endswith("/api/webhooks/generic")
