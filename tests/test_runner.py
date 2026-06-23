@@ -17,8 +17,6 @@ import respx
 from openloom_connector import Connector, FileEntry
 from openloom_connector.config import (
     ConnectorConfig,
-    OutboundWebhookConfig,
-    WebhookSource,
 )
 from openloom_connector.runner import Runner, _parse_docx, _parse_spec
 
@@ -51,13 +49,14 @@ def _config(connector_class: type[Connector] = InMemoryConnector, **kwargs: Any)
     inbox = kwargs.pop("inbox_dir", "/inbox")
     outbox = kwargs.pop("outbox_dir", "/outbox")
     archive = kwargs.pop("archive_dir", "")
-    secret = kwargs.pop("signing_secret", "")
     prefix = kwargs.pop("task_prefix", "task-")
+    # `signing_secret` is accepted for backward compatibility with old
+    # configs that still carry it — the runner no longer uses it.
+    kwargs.pop("signing_secret", None)
     return ConnectorConfig(
         connector_class=connector_class,
         connector_kwargs=kwargs,
         openloom_url="http://loom:55413",
-        webhook=WebhookSource(url="http://loom:55413/api/webhooks/generic", signing_secret=secret),
         inbox_dir=inbox,
         outbox_dir=outbox,
         archive_dir=archive,
@@ -518,28 +517,15 @@ def test_docx_result_does_not_truncate_long_metadata() -> None:
     assert long_input in table_text, "active_session_id should be preserved verbatim"
 
 
-# ── webhook signing ─────────────────────────────────────────────────────
+# ── outbound push has no signing header ────────────────────────────────
 
 
-def test_webhook_signs_when_secret_set() -> None:
-    conn = InMemoryConnector()
-    conn.files["/inbox/task-t.json"] = json.dumps({"goal": "x", "workspace": "/p"}).encode()
-    runner = Runner(_config(signing_secret="topsecret"))
-    runner._connector = conn
-
-    with respx.mock:
-        route = respx.post("http://loom:55413/api/webhooks/generic").mock(
-            return_value=httpx.Response(200, json={"taskId": "t1"}),
-        )
-        runner._poll_once()
-
-    sig = route.calls.last.request.headers.get("X-OpenLoom-Signature-256")
-    assert sig is not None
-    assert sig.startswith("sha256=")
-    assert len(sig) == len("sha256=") + 64
-
-
-def test_webhook_no_signature_when_no_secret() -> None:
+def test_push_to_openloom_does_not_sign() -> None:
+    """The connector no longer signs outbound task pushes — the
+    channel is a private localhost path between the two processes
+    on the same machine, and OpenLoom does not validate a signature
+    on the generic source anyway. Kept as a regression guard in case
+    signing is ever reinstated: the tests then need to be updated."""
     conn = InMemoryConnector()
     conn.files["/inbox/task-t.json"] = json.dumps({"goal": "x", "workspace": "/p"}).encode()
     runner = Runner(_config())
@@ -554,10 +540,46 @@ def test_webhook_no_signature_when_no_secret() -> None:
     assert "X-OpenLoom-Signature-256" not in route.calls.last.request.headers
 
 
+def test_push_url_is_openloom_url_plus_webhook_path() -> None:
+    """The connector constructs the push URL from ``openloom_url`` at
+    call time rather than from a config knob — there's no separate
+    webhook URL field any more."""
+    conn = InMemoryConnector()
+    conn.files["/inbox/task-t.json"] = json.dumps({"goal": "x", "workspace": "/p"}).encode()
+
+    custom_config = _config()
+    custom_config = ConnectorConfig(
+        connector_class=custom_config.connector_class,
+        connector_kwargs=custom_config.connector_kwargs,
+        openloom_url="http://my-host:9000",
+        inbox_dir=custom_config.inbox_dir,
+        outbox_dir=custom_config.outbox_dir,
+    )
+    runner = Runner(custom_config)
+    runner._connector = conn
+
+    with respx.mock:
+        route = respx.post("http://my-host:9000/api/webhooks/generic").mock(
+            return_value=httpx.Response(200, json={"taskId": "t1"}),
+        )
+        runner._poll_once()
+
+    assert route.called
+
+
 # ── run loop ─────────────────────────────────────────────────────────────
 
 
-async def test_run_loop_stops_on_signal() -> None:
+async def test_run_loop_stops_on_signal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``run()`` starts both the poll loop and the receiver. We pin
+    the listener to a free port via monkey-patch so this test does
+    not collide with other tests that bind 55414."""
+    import openloom_connector.runner as runner_mod
+
+    port = _free_port()
+    monkeypatch.setattr(runner_mod, "OPENLOOM_LISTEN_PORT", port)
+    monkeypatch.setattr(runner_mod, "OPENLOOM_LISTEN_PATH", "/listener/openloom")
+
     conn = InMemoryConnector()
     runner = Runner(_config(poll_interval_seconds=0))
     runner._connector = conn
@@ -612,42 +634,56 @@ def _free_port() -> int:
 def _running_server(runner: Runner):
     """Start a receiver server in a background thread and yield its port.
 
-    The thread is joined and the listening socket is closed on exit. Use
-    this in every receiver test that issues real HTTP requests — building
-    the server alone does not call ``accept()``.
+    The listener address is hardcoded (``OPENLOOM_LISTEN_PORT``) for
+    production — for tests we monkey-patch the constants to a free
+    port so the suite can run in parallel without collisions.
     """
-    server = runner._build_receiver_server()
-    runner._receiver_server = server  # mirrors what ``run()`` sets
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    import openloom_connector.runner as runner_mod
+    port = _free_port()
+    original_port = runner_mod.OPENLOOM_LISTEN_PORT
+    original_path = runner_mod.OPENLOOM_LISTEN_PATH
+    runner_mod.OPENLOOM_LISTEN_PORT = port
+    runner_mod.OPENLOOM_LISTEN_PATH = "/listener/openloom"
     try:
-        yield server.server_address[1]
+        server = runner._build_receiver_server()
+        runner._receiver_server = server
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield port
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            runner._receiver_server = None
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
-        runner._receiver_server = None
+        runner_mod.OPENLOOM_LISTEN_PORT = original_port
+        runner_mod.OPENLOOM_LISTEN_PATH = original_path
 
 
 def _receiver_config(**kwargs: Any) -> ConnectorConfig:
-    port = _free_port()
+    """Config fixture for receiver tests. The listener binds to the
+    constant ``OPENLOOM_LISTEN_PORT`` — we don't get to override it
+    in tests either, so any port conflict in CI is a constant-time
+    problem to investigate. ``_free_port()`` is unused here but kept
+    referenced for tools that want to spin up an *external* server."""
     return ConnectorConfig(
         connector_class=InMemoryConnector,
         connector_kwargs={},
         openloom_url="http://loom:55413",
-        webhook=WebhookSource(url="http://loom:55413/api/webhooks/generic"),
         inbox_dir=kwargs.get("inbox_dir", "/inbox"),
         outbox_dir=kwargs.get("outbox_dir", "/outbox"),
         archive_dir=kwargs.get("archive_dir", ""),
         poll_interval_seconds=0,
         task_prefix=kwargs.get("task_prefix", "task-"),
-        outbound=OutboundWebhookConfig(
-            enabled=True,
-            host="127.0.0.1",
-            port=port,
-            path="/listener/openloom",
-        ),
     )
+
+
+def _receiver_port_for_test() -> int:
+    """In tests we cannot reuse OPENLOOM_LISTEN_PORT across cases, so
+    we monkey-patch the constants to a free port. The build_receiver
+    code already reads them at construction time."""
+    return _free_port()
 
 
 def test_receiver_writes_result_on_task_completed() -> None:
@@ -860,10 +896,53 @@ def test_receiver_400_on_invalid_body() -> None:
         assert r.status_code == 400
 
 
-async def test_run_with_receiver_starts_and_stops() -> None:
-    """Integration smoke: run() with receiver enabled must accept a real
-    inbound HTTP request, and stop() must shut down the receiver thread."""
+async def test_run_logs_listener_url_for_openloom_setup(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The startup log explicitly tells the operator which URL to set
+    ``OPENLOOM_NOTIFY_WEBHOOK_URLS`` to on the OpenLoom side. This is
+    the only onboarding hint we have for the listener — if it
+    disappears, the integrator has to read source to find the right
+    URL."""
     import asyncio
+    import logging
+
+    import openloom_connector.runner as runner_mod
+
+    port = _free_port()
+    monkeypatch.setattr(runner_mod, "OPENLOOM_LISTEN_PORT", port)
+
+    runner = Runner(_receiver_config())
+    runner._connector = InMemoryConnector()
+
+    async def stop_soon() -> None:
+        await asyncio.sleep(0.05)
+        runner.stop()
+
+    caplog.set_level(logging.INFO, logger="openloom_connector.runner")
+    await asyncio.gather(runner.run(), stop_soon())
+
+    listener_messages = [
+        r.message for r in caplog.records
+        if "listener" in r.message.lower()
+    ]
+    assert listener_messages, "no listener log line emitted at startup"
+    expected_url = f"http://127.0.0.1:{port}/listener/openloom"
+    assert expected_url in " ".join(listener_messages)
+    assert "OPENLOOM_NOTIFY_WEBHOOK_URLS" in " ".join(listener_messages)
+
+
+async def test_run_with_receiver_starts_and_stops(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Integration smoke: run() must accept a real inbound HTTP
+    request to the hardcoded listener URL, and stop() must shut down
+    the receiver thread."""
+    import asyncio
+
+    import openloom_connector.runner as runner_mod
+
+    port = _free_port()
+    monkeypatch.setattr(runner_mod, "OPENLOOM_LISTEN_PORT", port)
 
     conn = InMemoryConnector()
     conn.files["/inbox/task-t.json"] = json.dumps({
@@ -871,7 +950,6 @@ async def test_run_with_receiver_starts_and_stops() -> None:
     }).encode()
     runner = Runner(_receiver_config())
     runner._connector = conn
-    port = runner._config.outbound.port
 
     async def driver() -> None:
         # Wait for the server to bind, then poke it.

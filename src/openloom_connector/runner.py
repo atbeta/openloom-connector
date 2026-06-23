@@ -30,7 +30,12 @@ from typing import Any
 import httpx
 
 from .base import Connector, FileEntry
-from .config import ConnectorConfig
+from .config import (
+    OPENLOOM_LISTEN_HOST,
+    OPENLOOM_LISTEN_PATH,
+    OPENLOOM_LISTEN_PORT,
+    ConnectorConfig,
+)
 
 _logger = logging.getLogger("openloom_connector.runner")
 
@@ -87,38 +92,39 @@ class Runner:
             server.shutdown()
 
     async def run(self) -> None:
-        """Run the polling loop (and outbound receiver if enabled) until
-        ``stop()`` is called."""
+        """Run the polling loop and the inbound receiver until
+        ``stop()`` is called.
+
+        The receiver is *always* started — the listener address is
+        hardcoded so OpenLoom knows exactly where to push events.
+        Integrators don't have to enable it, port-forward it, or
+        configure anything for it to work.
+        """
         _logger.info(
             "connector started — polling every %ds, prefix=%r",
             self._config.poll_interval_seconds,
             self._config.task_prefix,
         )
         _logger.info("openloom url: %s", self._config.openloom_url)
-        _logger.info("webhook:      %s", self._config.webhook.url)
+        listener_url = (
+            f"http://{OPENLOOM_LISTEN_HOST}:{OPENLOOM_LISTEN_PORT}"
+            f"{OPENLOOM_LISTEN_PATH}"
+        )
+        _logger.info(
+            "listener:     %s (OpenLoom should set "
+            "OPENLOOM_NOTIFY_WEBHOOK_URLS=%s)",
+            listener_url,
+            listener_url,
+        )
         _logger.info("inbox:        %s", self._config.inbox_dir)
         _logger.info("archive:      %s", self._config.archive_dir or "(disabled)")
 
         tasks: list[asyncio.Task[Any]] = [
             asyncio.create_task(self._poll_loop(), name="openloom-connector-poll"),
-        ]
-        if self._config.outbound.enabled:
-            _logger.info(
-                "receiver:     http://%s:%d%s (OpenLoom -> connector)",
-                self._config.outbound.host,
-                self._config.outbound.port,
-                self._config.outbound.path,
-            )
-            tasks.append(
-                asyncio.create_task(
-                    self._receiver_loop(), name="openloom-connector-receiver",
-                )
-            )
-        else:
-            _logger.info(
-                "receiver:     disabled (set outbound_webhook.enabled: true to "
-                "listen for task completion events)",
-            )
+            asyncio.create_task(
+                self._receiver_loop(), name="openloom-connector-receiver",
+            ),
+        ]  # type: ignore[arg-type]  # type checker doesn't grok the type narrowing
 
         try:
             await asyncio.gather(*tasks)
@@ -172,7 +178,9 @@ class Runner:
             server.server_close()
 
     def _build_receiver_server(self) -> ThreadingHTTPServer:
-        cfg = self._config.outbound
+        # The listener address is hardcoded so OpenLoom can target it
+        # via OPENLOOM_NOTIFY_WEBHOOK_URLS without the connector having
+        # to expose any webhook-related config knobs.
         runner_ref = self
 
         class _Handler(BaseHTTPRequestHandler):
@@ -182,7 +190,7 @@ class Runner:
                 _logger.debug("receiver " + format, *args)
 
             def do_POST(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
-                if self.path != cfg.path:
+                if self.path != OPENLOOM_LISTEN_PATH:
                     self.send_error(404, "unknown path")
                     return
                 length = int(self.headers.get("Content-Length") or 0)
@@ -211,7 +219,7 @@ class Runner:
 
         # ThreadingHTTPServer handles one request per thread, so a slow
         # write_result cannot block subsequent events.
-        return ThreadingHTTPServer((cfg.host, cfg.port), _Handler)
+        return ThreadingHTTPServer((OPENLOOM_LISTEN_HOST, OPENLOOM_LISTEN_PORT), _Handler)
 
     # ── event handling (used by the HTTP receiver) ─────────────────────
 
@@ -390,16 +398,10 @@ class Runner:
             )
 
     def _push_to_openloom(self, spec: dict[str, Any], entry: FileEntry) -> str | None:
-        """POST task spec to OpenLoom webhook. Return task_id or None."""
-        url = self._config.webhook.url
-        if not url:
-            _logger.error("webhook url not configured")
-            return None
+        """POST task spec to OpenLoom ``/api/webhooks/generic``. Return task_id or None."""
+        url = f"{self._config.openloom_url}/api/webhooks/generic"
         payload = json.dumps(spec).encode()
         headers = {"Content-Type": "application/json"}
-        if self._config.webhook.signing_secret:
-            sig = _sign_payload(self._config.webhook.signing_secret, payload)
-            headers["X-OpenLoom-Signature-256"] = f"sha256={sig}"
 
         # ``trust_env=False`` makes httpx ignore HTTP_PROXY / HTTPS_PROXY /
         # ALL_PROXY and the OS proxy config. Without it, a system-wide proxy

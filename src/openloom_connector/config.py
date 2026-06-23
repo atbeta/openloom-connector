@@ -1,4 +1,18 @@
-"""YAML config loader for the connector."""
+"""YAML config loader for the connector.
+
+The connector's config is intentionally minimal. Every field below
+maps to behaviour the *integrator* cares about — which storage
+backend, which inbox/outbox paths, how often to poll. The webhook
+listener (where OpenLoom pushes completion events) is **not**
+configurable: it always binds to ``127.0.0.1:55414/listener/openloom``
+so the integrator never has to copy the URL from OpenLoom's
+perspective into the connector's YAML.
+
+OpenLoom itself, on the other hand, is the part that decides where
+to send its outbound events — it stays an open webhook emitter,
+configured by ``OPENLOOM_NOTIFY_WEBHOOK_URLS``. The connector just
+makes sure the listening side is predictable.
+"""
 
 from __future__ import annotations
 
@@ -11,43 +25,31 @@ import yaml
 
 from .base import Connector
 
-
-@dataclass(frozen=True)
-class WebhookSource:
-    """OpenLoom webhook target configuration."""
-
-    url: str
-    signing_secret: str = ""
-    source: str = "generic"
-
-
-@dataclass(frozen=True)
-class OutboundWebhookConfig:
-    """Inbound listener for OpenLoom's outbound webhook events.
-
-    When OpenLoom task lifecycle changes (TASK_COMPLETED / TASK_FAILED /
-    TASK_UPDATED …) it POSTs a JSON event. The connector exposes this
-    tiny HTTP server to receive those events and call ``write_result``
-    for completed tasks. Without this, the connector can only push
-    tasks — it never learns when they finish.
-    """
-
-    enabled: bool = False
-    host: str = "127.0.0.1"
-    port: int = 55414
-    path: str = "/listener/openloom"
+# Hardcoded listener address. OpenLoom should be configured with
+# ``OPENLOOM_NOTIFY_WEBHOOK_URLS`` pointing at this URL. Keeping the
+# value constant means there's exactly one place in the system that
+# has to know where the receiver lives.
+OPENLOOM_LISTEN_HOST = "127.0.0.1"
+OPENLOOM_LISTEN_PORT = 55414
+OPENLOOM_LISTEN_PATH = "/listener/openloom"
+OPENLOOM_LISTENER_URL = (
+    f"http://{OPENLOOM_LISTEN_HOST}:{OPENLOOM_LISTEN_PORT}{OPENLOOM_LISTEN_PATH}"
+)
 
 
 @dataclass(frozen=True)
 class ConnectorConfig:
-    """Resolved connector configuration."""
+    """Resolved connector configuration.
+
+    The connector only ever talks to one OpenLoom (``openloom_url``,
+    which the connector uses to POST new task files). It listens for
+    completion events at the constant ``OPENLOOM_LISTENER_URL`` — that
+    side is intentionally not configurable here.
+    """
 
     connector_class: type[Connector]
     connector_kwargs: dict[str, Any] = field(default_factory=dict)
     openloom_url: str = "http://127.0.0.1:55413"
-    webhook: WebhookSource = field(
-        default_factory=lambda: WebhookSource(url=""),
-    )
     inbox_dir: str = "/inbox"
     outbox_dir: str = "/outbox"
     archive_dir: str = ""
@@ -55,9 +57,6 @@ class ConnectorConfig:
     state_path: Path | None = None
     task_prefix: str = "task-"
     result_suffix: str = ".result"
-    outbound: OutboundWebhookConfig = field(
-        default_factory=OutboundWebhookConfig,
-    )
 
 
 def load_config(path: str | Path) -> ConnectorConfig:
@@ -65,24 +64,26 @@ def load_config(path: str | Path) -> ConnectorConfig:
 
     Expected YAML structure::
 
-        openloom:
-          url: http://127.0.0.1:55413
-          source: generic
-
         connector:
           class: my_module.MyConnector
           kwargs:
             api_url: https://example.com
             token: xxx
 
+        openloom:
+          url: http://127.0.0.1:55413   # optional; default shown
+
         paths:
-          inbox: /tasks/incoming
-          outbox: /tasks/results
-          archive: /tasks/archive  # optional
+          inbox: /tasks/incoming         # optional; default /inbox
+          outbox: /tasks/results         # optional; default /outbox
+          archive: /tasks/archive        # optional
 
-        poll_interval_seconds: 10
+        poll_interval_seconds: 10         # optional
+        task_prefix: task-                 # optional
+        state_path: .openloom-connector/state.json   # optional
 
-        state_path: .openloom-connector/state.json  # optional
+    See ``OPENLOOM_LISTENER_URL`` for the address the connector
+    listens on for OpenLoom's outbound events.
     """
     path = Path(path)
     if not path.exists():
@@ -123,32 +124,13 @@ def load_config(path: str | Path) -> ConnectorConfig:
     task_prefix = str(raw.get("task_prefix") or "task-")
     result_suffix = str(raw.get("result_suffix") or ".result")
 
-    webhook_url = str(openloom.get("webhook_url") or f"{openloom_url}/api/webhooks/generic")
-    webhook = WebhookSource(
-        url=webhook_url,
-        signing_secret=str(openloom.get("signing_secret") or ""),
-        source=str(openloom.get("source") or "generic"),
-    )
-
     state_raw = raw.get("state_path")
     state_path = Path(state_raw).expanduser() if state_raw else None
-
-    outbound_raw = raw.get("outbound_webhook") or {}
-    if not isinstance(outbound_raw, dict):
-        raise ValueError("'outbound_webhook' must be a mapping")
-    outbound_enabled = bool(outbound_raw.get("enabled", False))
-    outbound = OutboundWebhookConfig(
-        enabled=outbound_enabled,
-        host=str(outbound_raw.get("host") or "127.0.0.1"),
-        port=int(outbound_raw.get("port") or 55414),
-        path=str(outbound_raw.get("path") or "/listener/openloom"),
-    )
 
     return ConnectorConfig(
         connector_class=cls,
         connector_kwargs=kwargs,
         openloom_url=openloom_url,
-        webhook=webhook,
         inbox_dir=inbox_dir,
         outbox_dir=outbox_dir,
         archive_dir=archive_dir,
@@ -156,7 +138,6 @@ def load_config(path: str | Path) -> ConnectorConfig:
         state_path=state_path,
         task_prefix=task_prefix,
         result_suffix=result_suffix,
-        outbound=outbound,
     )
 
 

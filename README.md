@@ -224,11 +224,12 @@ inbox/task-001.json  ─delete─  consumed input cleared
                          (also archived to /archive if configured)
 ```
 
-The connector polls the inbox and pushes task files to OpenLoom. Without
-the outbound webhook (see [`outbound_webhook`](#outbound-webhook-config)
-below), the connector never finds out when a task finishes — the result
-file in `outbox/` will never appear. Enable the receiver and point
-OpenLoom at it for the full lifecycle.
+The connector polls the inbox and pushes task files to OpenLoom.
+It also **always** listens for OpenLoom's outbound webhook events —
+that part is built-in, no opt-in. The listener address is fixed at
+`http://127.0.0.1:55414/listener/openloom`; when you start the
+connector the banner prints the exact URL you should set
+`OPENLOOM_NOTIFY_WEBHOOK_URLS` to on the OpenLoom side.
 
 Two output files per task:
 
@@ -244,11 +245,15 @@ storage's preview pane.
 
 ## Configuration reference
 
+The connector's YAML only exposes fields that the *integrator*
+actually needs to change — which storage backend, which inbox/outbox
+paths, how often to poll. The listener side is **always on** and
+**always** at the same address; OpenLoom is the side that decides
+where to push its events.
+
 | Field | Default | Description |
 |-------|---------|-------------|
-| `openloom.url` | `http://127.0.0.1:55413` | OpenLoom server URL |
-| `openloom.source` | `generic` | Webhook source name (matches `@register_source` on the OpenLoom side) |
-| `openloom.signing_secret` | `""` | Optional HMAC secret for signing the inbound webhook |
+| `openloom.url` | `http://127.0.0.1:55413` | OpenLoom server URL (the side the connector pushes tasks to) |
 | `connector.class` | — | **Required.** Dotted path to your `Connector` subclass |
 | `connector.kwargs` | `{}` | Passed to the connector's `__init__` |
 | `paths.inbox` | `/inbox` | Where to watch for incoming task files |
@@ -258,30 +263,30 @@ storage's preview pane.
 | `task_prefix` | `task-` | Files must start with this prefix to be processed |
 | `state_path` | `null` | Optional: path for connector-side state (e.g. cursor) |
 
-### Outbound webhook config
+### Listener address (hardcoded, not in YAML)
 
-The connector runs a tiny HTTP server that accepts completion events from
-OpenLoom's outbound webhook. Without this, the connector can only push
-tasks; it never learns when they finish.
+The connector accepts OpenLoom's outbound webhook events at:
 
-| Field | Default | Description |
-|-------|---------|-------------|
-| `outbound_webhook.enabled` | `false` | When `true`, the connector listens for completion events |
-| `outbound_webhook.host` | `127.0.0.1` | Bind address. Use `0.0.0.0` to accept events from a remote OpenLoom |
-| `outbound_webhook.port` | `55414` | Bind port |
-| `outbound_webhook.path` | `/listener/openloom` | URL path OpenLoom should POST to |
+```
+http://127.0.0.1:55414/listener/openloom
+```
 
-Point OpenLoom at the receiver:
+This address is fixed in code (`OPENLOOM_LISTENER_URL`) — there is
+no `outbound_webhook` section in the YAML. Point OpenLoom at the
+connector by setting:
 
 ```bash
 # In the OpenLoom process / container
 export OPENLOOM_NOTIFY_WEBHOOK_URLS='http://127.0.0.1:55414/listener/openloom'
 ```
 
-Only `TASK_COMPLETED` and `TASK_FAILED` events trigger a result file.
-Intermediate events (`TASK_CREATED`, `TASK_STARTED`, `TASK_UPDATED`) are
-acknowledged and ignored — they only matter if you build a custom source
-that cares about progress.
+If the connector and OpenLoom run on different machines, point
+OpenLoom at the connector's reachable host. The constant is a Python
+attribute on `openloom_connector.config` and can be inspected:
+
+```bash
+uv run python -c "from openloom_connector.config import OPENLOOM_LISTENER_URL; print(OPENLOOM_LISTENER_URL)"
+```
 
 ## CLI reference
 

@@ -10,7 +10,10 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .config import load_config
+from .config import (
+    OPENLOOM_LISTENER_URL,
+    load_config,
+)
 from .runner import Runner
 
 
@@ -72,17 +75,10 @@ def main() -> None:
     if args.command == "validate":
         print(f"OK — connector: {config.connector_class.__name__}")
         print(f"    openloom:   {config.openloom_url}")
-        print(f"    webhook:    {config.webhook.url}")
+        print(f"    listener:   {OPENLOOM_LISTENER_URL}")
         print(f"    inbox:      {config.inbox_dir}")
         print(f"    outbox:     {config.outbox_dir}")
         print(f"    poll:       {config.poll_interval_seconds}s")
-        if config.outbound.enabled:
-            print(
-                f"    receiver:   http://{config.outbound.host}:"
-                f"{config.outbound.port}{config.outbound.path}"
-            )
-        else:
-            print("    receiver:   disabled")
         return
 
     print(f"openloom-connector {__version__}")
@@ -101,13 +97,12 @@ def main() -> None:
 
 
 _TEMPLATE = """\
-# openloom-connector config — fill in the fields below.
-
-openloom:
-  url: http://127.0.0.1:55413
-  source: generic              # matches a @register_source on the OpenLoom side
-  webhook_url: ""               # override only if your OpenLoom webhook lives elsewhere
-  signing_secret: ""            # optional HMAC secret for inbound verification
+# openloom-connector config — minimum you need to fill in.
+#
+# The connector always listens for OpenLoom's outbound webhook events
+# at http://127.0.0.1:55414/listener/openloom — you do not need to
+# configure this. Just point OpenLoom's OPENLOOM_NOTIFY_WEBHOOK_URLS
+# at that URL when you start it.
 
 connector:
   class: my_package.MyConnector
@@ -121,17 +116,6 @@ paths:
   archive: ""                   # optional: archive consumed input files here
 
 poll_interval_seconds: 10
-
-# Inbound listener for OpenLoom's outbound webhook events (TASK_COMPLETED /
-# TASK_FAILED). Point OpenLoom's OPENLOOM_NOTIFY_WEBHOOK_URLS at this URL to
-# get task completion events pushed back into the connector so it can write
-# result files. Leave disabled to use the connector as a fire-and-forget task
-# submitter.
-outbound_webhook:
-  enabled: false
-  host: 127.0.0.1
-  port: 55414
-  path: /listener/openloom
 
 # state_path: .openloom-connector/state.json   # optional — local connector state
 """
