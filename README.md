@@ -88,8 +88,12 @@ This writes `openloom-connector.yaml` with all the fields explained.
 
 ### 2. Implement a `Connector` subclass
 
+Both `httpx` and `requests` are available as runtime dependencies.
+Pick whichever your team prefers — the connector framework itself
+uses `httpx` internally; this is just for *your* Connector code.
+
 ```python
-# my_connector.py
+# my_connector.py — httpx variant
 import httpx
 from openloom_connector import Connector, FileEntry
 
@@ -111,6 +115,35 @@ class MyCloudConnector(Connector):
 
     def delete_inbox(self, path: str) -> None:
         httpx.delete(f"{self._api}/file", params={"path": path}, headers=self._h)
+```
+
+Same example with `requests`:
+
+```python
+# my_connector.py — requests variant
+import requests
+from openloom_connector import Connector, FileEntry
+
+class MyCloudConnector(Connector):
+    def __init__(self, api_url: str, token: str) -> None:
+        self._api = api_url
+        self._h = {"Authorization": f"Bearer {token}"}
+        self._s = requests.Session()
+
+    def list_inbox(self) -> list[FileEntry]:
+        r = self._s.get(f"{self._api}/files", params={"dir": self.inbox_dir}, headers=self._h)
+        r.raise_for_status()
+        return [FileEntry(path=f["path"], name=f["name"], size=f["size"]) for f in r.json()]
+
+    def download(self, path: str) -> bytes | None:
+        r = self._s.get(f"{self._api}/file", params={"path": path}, headers=self._h)
+        return r.content if r.status_code == 200 else None
+
+    def upload(self, path: str, content: bytes) -> None:
+        self._s.put(f"{self._api}/file", params={"path": path}, data=content, headers=self._h)
+
+    def delete_inbox(self, path: str) -> None:
+        self._s.delete(f"{self._api}/file", params={"path": path}, headers=self._h)
 ```
 
 ### 3. Fill in the YAML
