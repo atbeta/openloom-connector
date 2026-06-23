@@ -145,8 +145,14 @@ class Runner:
             sig = _sign_payload(self._config.webhook.signing_secret, payload)
             headers["X-OpenLoom-Signature-256"] = f"sha256={sig}"
 
+        # ``trust_env=False`` makes httpx ignore HTTP_PROXY / HTTPS_PROXY /
+        # ALL_PROXY and the OS proxy config. Without it, a system-wide proxy
+        # (corporate VPN, Clash, mitmproxy, etc.) hijacks requests to
+        # 127.0.0.1 and the connector ends up POSTing through someone else's
+        # gateway — which returns a generic "Content Filter - Access Denied"
+        # page instead of the real OpenLoom response.
         try:
-            with httpx.Client(timeout=10.0) as client:
+            with httpx.Client(timeout=10.0, trust_env=False) as client:
                 resp = client.post(url, content=payload, headers=headers)
         except httpx.HTTPError as exc:
             _logger.error("POST %s failed: %s", url, exc)

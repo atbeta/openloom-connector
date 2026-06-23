@@ -7,6 +7,7 @@ import json
 from typing import Any
 
 import httpx
+import pytest
 import respx
 
 from openloom_connector import Connector, FileEntry
@@ -414,3 +415,28 @@ async def test_run_loop_stops_on_signal() -> None:
 
     import asyncio
     await asyncio.gather(runner.run(), stop_soon())
+
+
+def test_push_ignores_system_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """If HTTP_PROXY is set, the connector must still POST directly to
+    127.0.0.1. Regression test for the 'Content Filter - Access Denied'
+    symptom caused by httpx honouring system proxy env vars."""
+    conn = InMemoryConnector()
+    conn.files["/inbox/task-t.json"] = json.dumps({"goal": "x", "workspace": "/p"}).encode()
+    runner = Runner(_config())
+    runner._connector = conn
+
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:9999")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:9999")
+    monkeypatch.setenv("ALL_PROXY", "http://proxy.invalid:9999")
+
+    # respx mocks the loopback address, not the proxy. If trust_env is on,
+    # httpx routes through the proxy and respx sees nothing. If trust_env
+    # is off, the mock intercepts the request directly.
+    with respx.mock:
+        route = respx.post("http://loom:55413/api/webhooks/generic").mock(
+            return_value=httpx.Response(200, json={"taskId": "t1"}),
+        )
+        runner._poll_once()
+
+    assert route.call_count == 1
